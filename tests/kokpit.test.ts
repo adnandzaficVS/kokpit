@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { LIBRARY_TEXT } from './library.fixture'
+import { cacheState } from '../hooks/register'
 import { analyze, byProject, forecast, mcpDuplicates, spent } from '../hooks/lib'
 
 // Ulazi su izdvojeni jer TypeScript ne može izvesti tip preopterećenog $.tool.call za doslovne objekte.
@@ -112,9 +113,10 @@ test('analiza se prikazuje na kartici Pregled', async ($, on) => {
   mock.store(on)
   const desk = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...PANE })
   expect(await desk.find({ type: 'Text', text: /Model pregleda potrošnju/ })).toBeDefined()
+  expect(await desk.find({ type: 'Text', text: /Analiza modela je dostupna/ })).toBeUndefined()
   await desk.press({ key: 'run' })
   expect(await desk.find({ type: 'Text', text: /Zadnja analiza u/ })).toBeDefined()
-  expect(await desk.find({ type: 'Text', text: /nakon prvog odgovora/ })).toBeDefined()
+  expect(await desk.find({ type: 'Text', text: /Analiza modela je dostupna/ })).toBeDefined()
 })
 
 test('pinovani artefakt se vidi na kartici Artefakti i u traci', async ($, on) => {
@@ -124,7 +126,7 @@ test('pinovani artefakt se vidi na kartici Artefakti i u traci', async ($, on) =
   on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '' } }))
   await $.command.run({ command: 'kokpit-pin', args: 'https://claude.ai/artifact/abc-123 Plan projekta' })
   const desk = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...PANE })
-  await desk.press({ key: 'tab-artefakti' })
+  await desk.press({ key: 'tab-postavke' })
   expect(await desk.find({ type: 'Button', text: /Plan projekta/ })).toBeDefined()
   expect(await desk.find({ key: 'pin-open-0' })).toBeDefined()
   const BAND = { component: 'AbovePrompt' as const, props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 100, scroll: { offset: 0, bodyRows: 3 }, view: {} } }
@@ -144,7 +146,7 @@ test('biblioteka se čita i nudi za pinovanje', async ($, on) => {
     text: 'Showing 2 of 2 published artifacts:\n- (mine) Plan A — https://claude.ai/artifact/AAA111 — updated 2026-10-27\n- (mine, pinned) Plan B — https://claude.ai/artifact/BBB222 — updated 2026-10-20',
   }))
   const desk = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...PANE })
-  await desk.press({ key: 'tab-artefakti' })
+  await desk.press({ key: 'tab-postavke' })
   await desk.press({ key: 'add-lib' })
   expect(await desk.find({ key: 'lib-pin-1' })).toBeDefined()
   await desk.press({ key: 'lib-pin-1' })
@@ -159,7 +161,7 @@ test('velika biblioteka se crta bez greške', async ($, on) => {
   on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '' } }))
   on('tool.call', { tool: 'Artifact' }, () => ({ result: {}, text: LIBRARY_TEXT }))
   const desk = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...PANE })
-  await desk.press({ key: 'tab-artefakti' })
+  await desk.press({ key: 'tab-postavke' })
   await desk.press({ key: 'add-lib' })
   expect(await desk.find({ type: 'Text', text: /Još 72/ })).toBeDefined()
   await desk.input({ key: 'lib-search', text: 'gripper' })
@@ -175,7 +177,7 @@ test('drugo otvaranje istog artefakta ide u preglednik', async ($, on) => {
   on('session.cwd', () => ({ value: '/p/projekt' }))
   await $.command.run({ command: 'kokpit-pin', args: 'https://claude.ai/artifact/abc-123 Plan' })
   const desk = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...PANE })
-  await desk.press({ key: 'tab-artefakti' })
+  await desk.press({ key: 'tab-postavke' })
   calls.length = 0
   await desk.press({ key: 'pin-open-0' })
   await desk.press({ key: 'pin-open-0' })
@@ -196,4 +198,92 @@ test('pametno sažimanje koristi model iz postavki i ne siječe upute', { option
   await desk.press({ key: 'act-compact-upute' })
   expect(asked[0]).toEqual({ model: 'opus', effort: 'medium', maxTokens: 8000 })
   expect(filled).toBe(`/compact Zadržati: ${long}`)
+})
+
+test('kartica Postavke mijenja model za Smart compact', async ($, on) => {
+  mock.clock(on)
+  mock.store(on)
+  const asked: { model: string; effort?: string }[] = []
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'Radimo na Kokpitu' }] }) as never)
+  on('model.complete', (_$, e) => (asked.push({ model: e.model, effort: e.effort }), { value: { isAnswered: true, text: 'zadatak', usage: { input_tokens: 1, output_tokens: 1 } } }) as never)
+  on('prompt.fill', () => ({ isFilled: true }) as never)
+  on('ui.toast', () => ({ value: undefined }))
+  const desk = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...PANE })
+  await desk.press({ key: 'tab-postavke' })
+  await desk.select({ key: 'set-compact-model', value: 'haiku' })
+  await desk.select({ key: 'set-compact-effort', value: 'high' })
+  await desk.press({ key: 'tab-sesija' })
+  await desk.press({ key: 'act-compact-upute' })
+  expect(asked[0]).toEqual({ model: 'haiku', effort: 'high' })
+})
+
+test('Prompt: prvo pitanja, pa prijedlog koji ide u polje za unos', async ($, on) => {
+  mock.clock(on)
+  mock.store(on)
+  const prompts: string[] = []
+  let filled = ''
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'Radimo na izvještajima' }] }) as never)
+  on('model.complete', (_$, e) => {
+    prompts.push(e.prompt)
+    const text = prompts.length === 1 ? 'Evo: {"pitanja": ["Koji format datuma?"]}' : '{"prompt": "Dodaj izvoz izvještaja u PDF s datumom u formatu DD.MM.YYYY."}'
+    return { value: { isAnswered: true, text, usage: { input_tokens: 1, output_tokens: 1 } } } as never
+  })
+  on('prompt.fill', (_$, e) => ((filled = (e as { text: string }).text), { isFilled: true }) as never)
+  on('ui.toast', () => ({ value: undefined }))
+  const desk = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...PANE })
+  await desk.press({ key: 'tab-prompt' })
+  await desk.input({ key: 'prompt-draft', text: 'Izvoz u PDF', kind: 'change' })
+  await desk.press({ key: 'prompt-run' })
+  expect(prompts[0]).toContain('Dosadašnji razgovor')
+  expect(await desk.find({ type: 'Text', text: /Koji format datuma/ })).toBeDefined()
+  await desk.input({ key: 'prompt-a-0', text: 'DD.MM.YYYY', kind: 'change' })
+  await desk.press({ key: 'prompt-continue' })
+  expect(prompts[1]).toContain('Odgovor: DD.MM.YYYY')
+  await desk.press({ key: 'prompt-use' })
+  expect(filled).toContain('PDF')
+})
+
+test('Pregled: upozorenja skupljena, trošak se otvara klikom', async ($, on) => {
+  mock.clock(on)
+  mock.store(on)
+  const desk = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...PANE })
+  expect(await desk.find({ type: 'Text', text: /^Poruke$/ })).toBeUndefined()
+  await desk.press({ key: 'cost' })
+  expect(await desk.find({ type: 'Text', text: /^Poruke$/ })).toBeDefined()
+  await desk.press({ key: 'fold-state' })
+  expect(await desk.find({ key: 'cost' })).toBeDefined()
+  expect(await desk.find({ type: 'Text', text: /^Poruke$/ })).toBeUndefined()
+})
+
+test('Prompt: analiza promptova iz ove sesije', async ($, on) => {
+  mock.clock(on)
+  mock.store(on)
+  let sent = ''
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'popravi bug' }, { role: 'assistant', text: 'ok' }] }) as never)
+  on('model.complete', (_$, e) => ((sent = e.prompt), { value: { isAnswered: true, text: '## Šta poboljšati\n- Navesti fajl.', usage: { input_tokens: 1, output_tokens: 1 } } }) as never)
+  const desk = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...PANE })
+  await desk.press({ key: 'tab-prompt' })
+  await desk.press({ key: 'review-run' })
+  expect(sent).toContain('popravi bug')
+  expect(sent).not.toContain('ok')
+  expect(await desk.find({ type: 'Markdown', text: /Navesti fajl/ })).toBeDefined()
+})
+
+test('keš u traci: odbrojavanje i boje', async () => {
+  const step = (at: number, agentId?: string) => ({ turnId: 't', index: 0, model: 'm', input: 1, cacheRead: 1, cacheWrite: 0, output: 1, at, agentId })
+  expect(cacheState([], 60, 0)).toEqual({ value: '—', tone: 'muted' })
+  expect(cacheState([step(0)], 60, 10 * 60_000)).toEqual({ value: '50 min', tone: 'ok' })
+  expect(cacheState([step(0)], 60, 55 * 60_000)).toEqual({ value: '5 min', tone: 'warn' })
+  expect(cacheState([step(0)], 5, 6 * 60_000)).toEqual({ value: 'istekao', tone: 'bad' })
+  expect(cacheState([step(0), step(50 * 60_000, 'sub')], 60, 61 * 60_000).tone).toBe('bad')
+})
+
+test('uska traka i telefon: akcije u drugom redu', async ($, on) => {
+  mock.clock(on)
+  mock.store(on)
+  const band = (bodyColumns: number) => ({ component: 'AbovePrompt' as const, props: { hasSurvey: false, isWorking: false, maxRows: 4, bodyColumns, scroll: { offset: 0, bodyRows: 4 }, view: {} } })
+  for (const [surface, cols] of [['desktop', 70], ['mobile', 120], ['desktop', 120]] as const) {
+    const ui = await $.ui.mount({ plugin: 'kokpit', surface, ...band(cols) })
+    expect(await ui.find({ key: 'band-open' })).toBeDefined()
+  }
 })

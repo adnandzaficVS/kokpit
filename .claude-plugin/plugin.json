@@ -63,6 +63,40 @@
         "max"
       ],
       "default": "medium"
+    },
+    "promptModel": {
+      "type": "string",
+      "title": "Model za Prompt",
+      "description": "Model koji postavlja pitanja i predlaže prompt na kartici Prompt",
+      "options": [
+        "opus",
+        "sonnet",
+        "haiku"
+      ],
+      "default": "opus"
+    },
+    "promptNapor": {
+      "type": "string",
+      "title": "Napor za Prompt",
+      "description": "Koliko model razmišlja prije prijedloga prompta",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "medium"
+    },
+    "kesMinuta": {
+      "type": "string",
+      "title": "Trajanje keša (min)",
+      "description": "Koliko dugo keš traje bez novog zahtjeva; 60 za većinu planova, 5 kad je sesija u prekoračenju",
+      "options": [
+        "5",
+        "60"
+      ],
+      "default": "60"
     }
   }
 }

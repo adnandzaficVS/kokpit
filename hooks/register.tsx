@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelEffort, Register, RenderElement } from 'claude-code'
 
-import type { Breakdown, Budget, Pin, Report, HeavyCall, LimitSample, Measure, RepeatRead, SessionRecord, StepUsage, ToolStat, View, Warned } from '../types'
+import type { Breakdown, Budget, ModelChoice, ModelChoices, Pin, PromptReview, PromptStage, Report, HeavyCall, LimitSample, Measure, RepeatRead, SessionRecord, StepUsage, ToolStat, View, Warned } from '../types'
 import { analyze, byProject, byWeek, forecast, fmt, hitRate, limitName, mcpDuplicates, normServer, pct, periodStart, plural, resetText, serverLabel, serverOfTool, spent, tok, toolLabel, totals, usd } from './lib'
 import type { Forecast } from './lib'
 import { C, SERIES, TONE_TEXT, toneOf } from './charts'
@@ -45,11 +45,34 @@ const libQuery = atom({ plugin: 'kokpit', key: 'libQuery' } as const, '')
 const adding = atom({ plugin: 'kokpit', key: 'adding' } as const, null as 'lib' | 'link' | null)
 const pickNonce = atom({ plugin: 'kokpit', key: 'pickNonce' } as const, 0)
 const opened = atom({ plugin: 'kokpit', key: 'opened' } as const, [] as string[])
+const models = atom({ plugin: 'kokpit', key: 'models' } as const, {} as ModelChoices)
+const promptDraft = atom({ plugin: 'kokpit', key: 'promptDraft' } as const, '')
+const promptCtx = atom({ plugin: 'kokpit', key: 'promptCtx' } as const, true)
+const promptStage = atom({ plugin: 'kokpit', key: 'promptStage' } as const, 'idle' as PromptStage)
+const promptQuestions = atom({ plugin: 'kokpit', key: 'promptQuestions' } as const, [] as string[])
+const promptAnswers = atom({ plugin: 'kokpit', key: 'promptAnswers' } as const, [] as string[])
+const promptResult = atom({ plugin: 'kokpit', key: 'promptResult' } as const, null as string | null)
+const promptError = atom({ plugin: 'kokpit', key: 'promptError' } as const, null as string | null)
+const folds = atom({ plugin: 'kokpit', key: 'folds' } as const, {} as Record<string, boolean>)
+const cacheTick = atom({ plugin: 'kokpit', key: 'cacheTick' } as const, 0)
+
+// Keš traje `ttl` od zadnjeg zahtjeva glavnog razgovora; zadnja petina vremena je upozorenje.
+export const cacheState = (all: readonly StepUsage[], ttlMin: number, now: number): { value: string; tone: Tone } => {
+  const last = [...all].reverse().find(x => !x.agentId)
+  if (!last) return { value: '—', tone: 'muted' }
+  const left = last.at + ttlMin * 60_000 - now
+  if (left <= 0) return { value: 'istekao', tone: 'bad' }
+  const min = Math.ceil(left / 60_000)
+  return { value: `${min} min`, tone: left <= ttlMin * 12_000 ? 'warn' : 'ok' }
+}
+const promptReview = atom({ plugin: 'kokpit', key: 'promptReview' } as const, null as PromptReview | null)
+const reviewBusy = atom({ plugin: 'kokpit', key: 'reviewBusy' } as const, false)
+const reviewScope = atom({ plugin: 'kokpit', key: 'reviewScope' } as const, 'sesija' as 'sesija' | 'projekat')
 
 // Select prima najviše 64 opcije; jedna ide na „Odaberi…“.
 const MAX_OPTIONS = 60
 
-const VIEWS: View[] = ['sesija', 'potrosnja', 'troskovi', 'artefakti']
+const VIEWS: View[] = ['sesija', 'potrosnja', 'troskovi', 'prompt', 'postavke']
 
 const loadHistory = async ($: EngineInterface): Promise<SessionRecord[]> => {
   const v = await $.store.get(HISTORY)
@@ -113,9 +136,10 @@ const analysisBody = async ($: EngineInterface, ai: boolean, pragAlata: number) 
       .map(m => `- (${fmt(tok(m.text.length))} tok) ${m.text.replace(/\s+/g, ' ').slice(0, 200)}`)
       .join('\n')
     const heavyList = data.heavy.slice(-8).map(x => `- ${x.tool} ~${fmt(tok(x.chars))} tok: ${x.label}`).join('\n')
+    const am = await chosen($, 'analysis')
     const r = await $.model.complete({
-      model: analysisModel.model,
-      effort: analysisModel.effort,
+      model: am.model,
+      effort: am.effort,
       maxTokens: 8000,
       system:
         'Pišeš stručni izvještaj o potrošnji tokena u Claude Code sesiji. Jezik: standardni bosanski, ijekavica. Ton: profesionalan, neutralan i sažet, kao tehnička dokumentacija. Koristi bezlične konstrukcije i ne pretpostavljaj rod korisnika. Ne komentariši ton, raspoloženje ni zadovoljstvo korisnika. Ne obraćaj se čitaocu uzvicima i ne ponavljaj tabelu iz ulaza. Markdown, bez naslova prvog nivoa.',
@@ -170,16 +194,213 @@ const runAction = async ($: EngineInterface, id: ActionId) => {
 
 // Iz zadnjih poruka i fajlova sesije model sastavlja upute za /compact; bez modela ostaje prazan predložak.
 const EFFORTS: readonly ModelEffort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+const MODELS = ['opus', 'sonnet', 'haiku'] as const
 // Postavlja se iz userConfig pri učitavanju moda.
 let compactModel: { model: string; effort: ModelEffort } = { model: 'opus', effort: 'medium' }
 let analysisModel: { model: string; effort: ModelEffort } = { model: 'opus', effort: 'medium' }
+let promptModel: { model: string; effort: ModelEffort } = { model: 'opus', effort: 'medium' }
 const modelOf = (model: unknown, effort: unknown) => ({
   model: typeof model === 'string' && model ? model : 'opus',
   effort: EFFORTS.find(x => x === effort) ?? 'medium',
 })
 
+// Izbor iz kartice Postavke ima prednost pred postavkama moda.
+const chosen = async ($: EngineInterface, which: keyof ModelChoices): Promise<ModelChoice> =>
+  (await read($, models))[which] ?? (which === 'compact' ? compactModel : which === 'analysis' ? analysisModel : promptModel)
+
+const setChoice = async ($: EngineInterface, which: keyof ModelChoices, patch: Partial<ModelChoice>) => {
+  const cur = await chosen($, which)
+  const next = { ...(await read($, models)), [which]: { ...cur, ...patch } }
+  await update($, models, () => next)
+  await $.store.set('models', next)
+}
+
+// Prompt: model prvo traži nedoumice; kad ih nema, ili kad su odgovorene, piše prompt.
+const PROMPT_SYSTEM =
+  'Pomažeš sastaviti prompt za Claude Code (agent za programiranje koji radi u projektu korisnika). ' +
+  'Prompt piši na jeziku zahtjeva, jasno i konkretno: cilj, kontekst, ograničenja, šta je gotov posao i kako se provjerava. ' +
+  'Ne izmišljaj činjenice o projektu; što nije poznato, ostavi kao pitanje. ' +
+  'Odgovor je isključivo JSON, bez ičega oko njega: {"pitanja": ["…"]} kad postoje nedoumice koje bitno mijenjaju prompt (najviše četiri, kratka i konkretna), inače {"prompt": "…"}.'
+
+const conversation = async ($: EngineInterface) =>
+  (await $.session.messages())
+    .filter(m => m.text.trim())
+    .slice(-20)
+    .map(m => `${m.role === 'user' ? 'Korisnik' : 'Claude'}: ${m.text.replace(/\s+/g, ' ').slice(0, 1500)}`)
+    .join('\n')
+
+const parsePromptReply = (text: string): { pitanja?: string[]; prompt?: string } | null => {
+  const json = text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)
+  try {
+    const v = JSON.parse(json) as { pitanja?: unknown; prompt?: unknown }
+    const pitanja = Array.isArray(v.pitanja) ? v.pitanja.filter((x): x is string => typeof x === 'string' && !!x.trim()).slice(0, 4) : undefined
+    return { pitanja, prompt: typeof v.prompt === 'string' ? v.prompt.trim() : undefined }
+  } catch {
+    return null
+  }
+}
+
+const suggestPrompt = async ($: EngineInterface, withAnswers: boolean) => {
+  const draft = (await read($, promptDraft)).trim()
+  if (!draft) {
+    await update($, promptError, () => 'Upisati šta treba uraditi.')
+    return
+  }
+  await update($, promptStage, () => 'busy')
+  await update($, promptError, () => null)
+  const pm = await chosen($, 'prompt')
+  const ctx = (await read($, promptCtx)) ? await conversation($).catch(() => '') : ''
+  const qs = await read($, promptQuestions)
+  const as = await read($, promptAnswers)
+  const answered = withAnswers ? qs.map((q, i) => `- ${q}\n  Odgovor: ${as[i]?.trim() || '(bez odgovora, odluči razumno)'}`).join('\n') : ''
+  const r = await $.model
+    .complete({
+      model: pm.model,
+      effort: pm.effort,
+      maxTokens: 8000,
+      system: PROMPT_SYSTEM,
+      prompt: [
+        `Zahtjev korisnika:\n${draft}`,
+        ctx && `Dosadašnji razgovor u sesiji (kontekst):\n${ctx}`,
+        answered && `Odgovori na nedoumice:\n${answered}\n\nSada obavezno vrati {"prompt": "…"}.`,
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
+    })
+    .catch(() => null)
+  const v = r?.isAnswered ? parsePromptReply(r.text) : null
+  if (!v) {
+    await update($, promptStage, () => 'idle')
+    await update($, promptError, () => (r && !r.isAnswered ? `Model nije odgovorio (${r.reason}).` : 'Odgovor modela nije bio u očekivanom obliku. Pokušati ponovo.'))
+    return
+  }
+  if (!withAnswers && v.pitanja?.length) {
+    await update($, promptQuestions, () => v.pitanja ?? [])
+    await update($, promptAnswers, () => (v.pitanja ?? []).map(() => ''))
+    await update($, promptStage, () => 'questions')
+    return
+  }
+  await update($, promptResult, () => v.prompt ?? '')
+  await update($, promptStage, () => 'done')
+}
+
+const resetPrompt = async ($: EngineInterface) => {
+  await update($, promptStage, () => 'idle')
+  await update($, promptQuestions, () => [])
+  await update($, promptAnswers, () => [])
+  await update($, promptResult, () => null)
+  await update($, promptError, () => null)
+}
+
+// Skupljive kartice: zapamćeno stanje ili zadano (Stanje otvoreno, Upozorenja i Analiza skupljeni).
+const isOpen = async ($: EngineInterface, id: string, def: boolean) => (await read($, folds))[id] ?? def
+const setOpen = (($: EngineInterface, id: string, open: boolean) => update($, folds, f => ({ ...f, [id]: open })))
+
+// Analiza promptova: korisnikove poruke iz ove sesije ili iz zadnjih razgovora projekta.
+const PROMPTS_PY = [
+  'import glob, json, os, sys',
+  "base = os.path.expanduser('~/.claude/projects')",
+  "dirs = glob.glob(os.path.join(base, glob.escape(sys.argv[1]) + '*'))",
+  "files = sorted([f for d in dirs for f in glob.glob(os.path.join(d, '*.jsonl'))], key=os.path.getmtime, reverse=True)[: int(sys.argv[2])]",
+  'out = []',
+  'for f in reversed(files):',
+  "    for line in open(f, errors='ignore'):",
+  "        if '\"user\"' not in line or 'tool_result' in line:",
+  '            continue',
+  '        try:',
+  '            o = json.loads(line)',
+  '        except Exception:',
+  '            continue',
+  "        if o.get('type') != 'user' or o.get('isMeta') or o.get('isSidechain'):",
+  '            continue',
+  "        c = (o.get('message') or {}).get('content')",
+  "        t = c if isinstance(c, str) else ' '.join(x.get('text', '') for x in c if isinstance(x, dict) and x.get('type') == 'text') if isinstance(c, list) else ''",
+  '        t = t.strip()',
+  "        if t and not t.startswith('<'):",
+  '            out.append(t[:800])',
+  'print(json.dumps(out[-80:]))',
+].join('\n')
+
+const REVIEW_SYSTEM =
+  'Analiziraš kako korisnik piše promptove za Claude Code (agent za programiranje). Glavni cilj je preciznost odgovora: da agent tačno razumije zadatak, kontekst, ograničenja i kad je posao gotov; manja potrošnja tokena je sporedna. ' +
+  'Jezik: bosanski, ijekavica, bezlične konstrukcije, profesionalan i sažet ton. ' +
+  'Markdown bez naslova prvog nivoa, tri dijela s naslovima drugog nivoa: „Šta je dobro“ (dvije do tri stavke), ' +
+  '„Šta poboljšati“ (najviše pet stavki; svaka konkretna, s kratkim primjerom iz korisnikovih promptova: prije → poslije) ' +
+  'i „Šablon“ (kratak šablon za buduće promptove u bloku koda).'
+
+const reviewPrompts = async ($: EngineInterface, scope: 'sesija' | 'projekat') => {
+  await update($, reviewBusy, () => true)
+  try {
+    let list: string[] = []
+    if (scope === 'sesija') {
+      list = (await $.session.messages()).filter(m => m.role === 'user' && m.text.trim() && !m.text.trim().startsWith('<')).map(m => m.text.trim().slice(0, 800))
+    } else {
+      const key = (await read($, project)) ?? (await projectOf($))
+      const r = await $.process.run(['/usr/bin/env', 'python3', '-c', PROMPTS_PY, key.replace(/[^A-Za-z0-9]/g, '-'), '10'], { timeoutMs: 30000 }).catch(() => null)
+      try {
+        const v = JSON.parse(r?.stdout ?? '[]') as unknown
+        list = Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+      } catch {
+        list = []
+      }
+    }
+    const at = await $.clock.now()
+    if (!list.length) {
+      await update($, promptReview, () => ({ text: null, note: 'Nema promptova za analizu u odabranom opsegu.', at, count: 0, scope }))
+      return
+    }
+    const pm = await chosen($, 'prompt')
+    const r = await $.model
+      .complete({ model: pm.model, effort: pm.effort, maxTokens: 8000, system: REVIEW_SYSTEM, prompt: `Korisnikovi promptovi (${list.length}, od starijih ka novijim):\n\n${list.map((x, i) => `${i + 1}. ${x.replace(/\s+/g, ' ')}`).join('\n')}` })
+      .catch(() => null)
+    await update($, promptReview, () => ({
+      text: r?.isAnswered ? r.text.trim() : null,
+      note: r?.isAnswered ? null : `Analiza nije uspjela${r ? ` (${r.reason})` : ''}.`,
+      at,
+      count: list.length,
+      scope,
+    }))
+    await setOpen($, 'review', true)
+  } finally {
+    await update($, reviewBusy, () => false)
+  }
+}
+
+// Servisi same aplikacije: nisu korisnikov izbor, pa ih nema smisla nuditi za isključivanje.
+const BUILTIN_MCP = /^(ccd_|plugin-authoring$|claude-in-chrome$|claude_browser$|claude_code_ios_simulator$|computer-use$|terminal$|visualize$|mcp-registry$|scheduled-tasks$)/i
+
+// Nastavljena sesija nema brojki dok ne stigne novi zahtjev: kontekst i limiti se čitaju odmah,
+// a vrijeme zadnjeg zahtjeva (za keš) iz zapisa razgovora.
+const seedResumed = async ($: EngineInterface, id: string) => {
+  const u = await $.session.usage().catch(() => null)
+  const now = await $.clock.now()
+  if (u && (await read($, measure)) == null)
+    await update($, measure, () => ({
+      percent: u.context.percent ?? null,
+      tokens: u.context.tokens ?? null,
+      window: u.context.window,
+      usd: u.cost?.usd ?? null,
+      rateLimits: u.rateLimits.map(r => ({ kind: r.kind, percentUsed: r.percentUsed, resetsAt: r.resetsAt })),
+      at: now,
+    }))
+  if ((await read($, steps)).length) return
+  const r = await $.process
+    .run(['/bin/sh', '-c', 'f=$(ls "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1); [ -n "$f" ] && tail -n 400 "$f" | grep \'"type":"assistant"\' | tail -1', 'sh', id], { timeoutMs: 10000 })
+    .catch(() => null)
+  try {
+    const o = JSON.parse(r?.stdout.trim() || 'null') as { timestamp?: string; message?: { model?: string; usage?: Record<string, number> } } | null
+    const at = Date.parse(o?.timestamp ?? '')
+    const us = o?.message?.usage
+    if (!Number.isFinite(at) || !us) return
+    const step: StepUsage = { turnId: 'nastavak', index: 0, model: o?.message?.model ?? '', input: us.input_tokens ?? 0, cacheRead: us.cache_read_input_tokens ?? 0, cacheWrite: us.cache_creation_input_tokens ?? 0, output: us.output_tokens ?? 0, at }
+    await update($, steps, l => (l.length ? l : [step]))
+  } catch {
+    // Zapis nije čitljiv; keš ostaje „—“ do prvog zahtjeva.
+  }
+}
+
 const smartCompact = async ($: EngineInterface) => {
-  const cm = compactModel
+  const cm = await chosen($, 'compact')
   $.ui.toast(`Model ${cm.model} (${cm.effort}) priprema upute za sažimanje…`, { timeoutMs: 15000 })
   const prompts = (await $.session.messages())
     .filter(m => m.role === 'user' && m.text.trim())
@@ -387,14 +608,19 @@ const togglePane = async ($: EngineInterface) => {
 export const register: Register = (on, options) => {
   const pragAlata = typeof options.pragAlata === 'number' ? options.pragAlata : 8000
   const ai = options.ai !== false
+  const cacheTtl = options.kesMinuta === '5' ? 5 : 60
   compactModel = modelOf(options.sazimanjeModel, options.sazimanjeNapor)
   analysisModel = modelOf(options.analizaModel, options.analizaNapor)
+  promptModel = modelOf(options.promptModel, options.promptNapor)
   let sessionStart = 0
   let sessionId: string | null = null
 
   on('session.start', async ($, e, next) => {
     sessionStart = await $.clock.now()
     sessionId = await $.session.id()
+    // Odbrojavanje keša u traci treba novo crtanje i kad se ništa drugo ne dešava.
+    void $.clock.every(15_000, () => void update($, cacheTick, n => n + 1))
+    void seedResumed($, sessionId).catch(() => undefined)
     const sv = await $.store.get('samples')
     if (Array.isArray(sv)) await update($, samples, () => (sv as LimitSample[]).filter(x => sessionStart - x.at < 3 * 3600_000))
     const bv = (await $.store.get('budget')) as Budget | undefined
@@ -402,6 +628,8 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'kokpit', description: 'Otvara Kokpit: stanje sesije, akcije i analiza' })
     await $.command.register({ name: 'kokpit-analiza', description: 'Analizira potrošnju u ovoj sesiji i daje preporuke' })
     await $.command.register({ name: 'kokpit-historija', description: 'Prikazuje trošak prethodnih sesija' })
+    const mv = await $.store.get('models')
+    if (mv && typeof mv === 'object' && !Array.isArray(mv)) await update($, models, () => mv as ModelChoices)
     const key = await projectOf($)
     await update($, project, () => key)
     await update($, pins, () => [])
@@ -466,7 +694,7 @@ export const register: Register = (on, options) => {
       const at = await $.clock.now()
       const isNew = !(await read($, recent)).some(x => x.url === url)
       await update($, recent, list => [{ url, title, at }, ...list.filter(x => x.url !== url)].slice(0, 10))
-      if (isNew && !(await read($, pins)).some(x => x.url === url)) $.ui.toast(`Artefakt „${title}“ se može pinovati u Kokpitu, kartica Artefakti.`, { timeoutMs: 6000 })
+      if (isNew && !(await read($, pins)).some(x => x.url === url)) $.ui.toast(`Artefakt „${title}“ se može pinovati u Kokpitu, kartica Postavke.`, { timeoutMs: 6000 })
     }
     return ran
   })
@@ -647,6 +875,8 @@ export const register: Register = (on, options) => {
     const p = m?.percent ?? null
     const pinned = await read($, pins)
     const nonce = await read($, pickNonce)
+    await read($, cacheTick)
+    const cache = cacheState(await read($, steps), cacheTtl, await $.clock.now())
 
     // Traka pokazuje ono što ograničava rad: 5 h i 7 d uvijek, ostale limite i budžet tek kad pređu 80 %.
     const limits = (m?.rateLimits ?? [])
@@ -660,31 +890,44 @@ export const register: Register = (on, options) => {
         <Text weight="semibold" tabular color={tone === 'muted' ? undefined : TONE_TEXT[tone]}>{value}</Text>
       </Box>
     )
-    // Uska traka: brojke se skupljaju, dugmad nikad; ako ni tad nema mjesta, dugmad prelaze u novi red.
-    const isNarrow = e.props.bodyColumns < 90
-    return (
+    // Široka traka: brojke lijevo, dugmad desno. Uska traka i telefon: brojke u prvom redu, dugmad u drugom.
+    const cols = e.props.bodyColumns
+    const stacked = cols < 90 || e.surface === 'mobile'
+    const metrics = (
+      <Box alignItems="center" gap="md" flexShrink={1} flexWrap="wrap">
+        {item('Kontekst', pctText(p), toneOf(p))}
+        {limits.map(l => item(l.label, pctText(l.percent), toneOf(l.percent)))}
+        {item('Keš', cache.value, cache.tone)}
+        {cols >= 60 && item('Trošak', usd(m?.usd), 'muted')}
+      </Box>
+    )
+    const actions = (
+      <Box alignItems="center" gap="sm" flexShrink={0} flexWrap="wrap">
+        {Select && pinned.length > 0 && (
+          <Select
+            key={`band-pins-${nonce}`}
+            value=""
+            options={[{ value: '', label: 'Artefakti' }, ...pinned.slice(0, MAX_OPTIONS).map(x => ({ value: x.url, label: x.title }))]}
+            onSelect={url => {
+              // Nova instanca menija vraća ga na „Artefakti“, pa se isti artefakt može ponovo odabrati.
+              void update($, pickNonce, n => n + 1)
+              if (url) void openArtifact($, url)
+            }}
+          />
+        )}
+        {p != null && p >= 60 && <Button key="band-compact" label={cols < 70 ? '✦ Smart' : '✦ Smart compact'} variant="primary" onPress={() => void smartCompact($)} />}
+        <Button key="band-open" label="◔ Kokpit" variant="secondary" onPress={() => togglePane($)} />
+      </Box>
+    )
+    return stacked ? (
+      <Box flexDirection="column" gap="xs">
+        {metrics}
+        {actions}
+      </Box>
+    ) : (
       <Box justifyContent="space-between" alignItems="center" columnGap="md" rowGap="xs" flexWrap="wrap">
-        <Box alignItems="center" gap="md" flexShrink={1}>
-          {item('Kontekst', pctText(p), toneOf(p))}
-          {limits.map(l => item(l.label, pctText(l.percent), toneOf(l.percent)))}
-          {!isNarrow && item('Trošak', usd(m?.usd), 'muted')}
-        </Box>
-        <Box alignItems="center" gap="sm" flexShrink={0}>
-          {Select && pinned.length > 0 && (
-            <Select
-              key={`band-pins-${nonce}`}
-              value=""
-              options={[{ value: '', label: 'Artefakti' }, ...pinned.slice(0, MAX_OPTIONS).map(x => ({ value: x.url, label: x.title }))]}
-              onSelect={url => {
-                // Nova instanca menija vraća ga na „Artefakti“, pa se isti artefakt može ponovo odabrati.
-                void update($, pickNonce, n => n + 1)
-                if (url) void openArtifact($, url)
-              }}
-            />
-          )}
-          {p != null && p >= 60 && <Button key="band-compact" label="Compact" variant="primary" onPress={() => runCommand($, 'compact')} />}
-          <Button key="band-open" label="◔ Kokpit" variant="secondary" onPress={() => togglePane($)} />
-        </Box>
+        {metrics}
+        {actions}
       </Box>
     )
   })
@@ -704,7 +947,8 @@ export const register: Register = (on, options) => {
       ['sesija', '1', 'Pregled'],
       ['potrosnja', '2', 'Potrošnja'],
       ['troskovi', '3', 'Troškovi'],
-      ['artefakti', '4', 'Artefakti'],
+      ['prompt', '4', 'Prompt'],
+      ['postavke', '5', 'Postavke'],
     ] as const
     const page = (...body: Child[]) => (
       <Box flexDirection="column">
@@ -727,11 +971,23 @@ export const register: Register = (on, options) => {
       const r = await read($, report)
       const isBusy = await read($, busy)
       const pending = await read($, confirm)
+      const am = await chosen($, 'analysis')
+      const pinnedList = await read($, pins)
       const rec: ActionId | null = p != null && p >= 80 ? 'compact' : p != null && p >= 60 ? 'compact-upute' : null
+      const fold = async (id: string, def: boolean) => {
+        const open = await isOpen($, id, def)
+        return { key: `fold-${id}`, open, toggle: () => void setOpen($, id, !open) }
+      }
+      const costOpen = await isOpen($, 'cost', false)
+      const showAll = await isOpen($, 'analysis-full', false)
+      const LINES = 40
+      const aiLines = (r?.ai ?? '').split('\n')
+      const aiText = showAll || aiLines.length <= LINES ? r?.ai ?? '' : aiLines.slice(0, LINES).join('\n')
+      const worst: Tone = st.alerts.some(x => x.tone === 'bad') ? 'bad' : 'warn'
       return page(
         st.alerts.length > 0 &&
           k.card(
-            { title: 'Upozorenja', tone: st.alerts.some(x => x.tone === 'bad') ? 'bad' : 'warn' },
+            { title: `Upozorenja · ${st.alerts.length}`, tone: worst, fold: await fold('alerts', false) },
             ...st.alerts.map((a, i) =>
               k.row({
                 title: <Text wrap="wrap"><Text color={TONE_TEXT[a.tone]}>● </Text>{a.text}</Text>,
@@ -740,35 +996,32 @@ export const register: Register = (on, options) => {
             ),
           ),
         k.card(
-          { title: 'Stanje' },
+          {
+            title: 'Stanje',
+            fold: await fold('state', true),
+            action: k.btn({ key: 'cost', text: `${usd(m?.usd)} ${costOpen ? '▴' : '▾'}`, plain: true, onPress: () => void setOpen($, 'cost', !costOpen) }),
+          },
+          costOpen && (
+            <Box gap="lg" flexWrap="wrap" borderStyle="round" borderDimColor paddingX="md" paddingY="xs">
+              {figure('Trošak', usd(m?.usd))}
+              {figure('Keš', pct(hit), hit != null && t.steps > 3 && hit < 0.6 ? 'warn' : undefined)}
+              {figure('Zahtjevi', `${t.steps}`)}
+              {figure('Poruke', `${await read($, turns)}`)}
+            </Box>
+          ),
           k.gauge({ title: 'Kontekst', value: pctText(p), tone: toneOf(p), percent: p, sub: m?.tokens == null ? 'Brojke nakon prvog odgovora' : `${fmt(m.tokens)} od ${fmt(m.window)} tokena` }),
           ...lim.map(x => k.gauge({ title: x.short ?? x.label, value: pctText(x.percent), tone: toneOf(x.percent), percent: x.percent, sub: x.reset, hint: x.noteColor === C.gray ? undefined : x.note, hintTone: toneFromHex(x.noteColor) })),
         ),
-        k.card(
-          { title: 'Ova sesija' },
-          <Box gap="lg" flexWrap="wrap">
-            {figure('Trošak', usd(m?.usd))}
-            {figure('Keš', pct(hit), hit != null && t.steps > 3 && hit < 0.6 ? 'warn' : undefined)}
-            {figure('Zahtjevi', `${t.steps}`)}
-            {figure('Poruke', `${await read($, turns)}`)}
-          </Box>,
-        ),
-        k.card(
-          {
-            title: 'Analiza sesije',
-            description: isBusy ? `Model ${analysisModel.model} (${analysisModel.effort}) čita statistiku i zadnje poruke…` : r ? `Zadnja analiza u ${hhmm(r.at)}` : 'Model pregleda potrošnju i predloži šta promijeniti.',
-            action: k.btn({ key: 'run', text: isBusy ? 'Analiza u toku…' : r ? 'Ponovi' : 'Analiziraj', hotkey: 'a', variant: r ? 'secondary' : 'primary', onPress: () => (isBusy ? undefined : void runAnalysis($, ai, pragAlata)) }),
-          },
-          r?.ai && md(r.ai),
-          r?.aiNote && k.note(r.aiNote, 'warn'),
-          r && r.tips.length > 0 && (
-            <Box flexDirection="column" gap="xs">
-              {k.label('Uočeno u statistici')}
-              {md(r.tips.map(x => `- ${x}`).join('\n'))}
-            </Box>
+        pinnedList.length > 0 &&
+          k.card(
+            { title: 'Artefakti', action: <Button key="pins-edit" label="Uredi" plain dimColor onPress={() => void update($, view, () => 'postavke' as View)} /> },
+            ...pinnedList.slice(0, 8).map((x, i) => (
+              <Button key={`home-pin-${i}`} plain onPress={() => void openArtifact($, x.url)}>
+                {x.title}
+              </Button>
+            )),
+            pinnedList.length > 8 && k.note(`Još ${pinnedList.length - 8} u Postavkama.`),
           ),
-          r && !r.ai && r.tips.length === 0 && k.note('Nema uočenih odstupanja. Potrošnja je u očekivanim granicama.'),
-        ),
         k.card(
           { title: 'Akcije' },
           ...ACTIONS.map(x => {
@@ -779,6 +1032,26 @@ export const register: Register = (on, options) => {
               right: k.btn({ key: `act-${x.id}`, text: armed ? 'Confirm' : x.button, hotkey: x.key, variant: x.id === rec || armed ? 'primary' : 'secondary', onPress: () => void runAction($, x.id) }),
             })
           }),
+        ),
+        k.card(
+          {
+            title: 'Analiza sesije',
+            fold: await fold('analysis', false),
+            description: isBusy ? `Model ${am.model} (${am.effort}) čita statistiku i zadnje poruke…` : r ? `Zadnja analiza u ${hhmm(r.at)}` : 'Model pregleda potrošnju i predloži šta promijeniti.',
+            action: k.btn({ key: 'run', text: isBusy ? 'Analiza u toku…' : r ? 'Ponovi' : 'Analiziraj', hotkey: 'a', variant: r ? 'secondary' : 'primary', onPress: () => (isBusy ? undefined : void runAnalysis($, ai, pragAlata).then(() => setOpen($, 'analysis', true))) }),
+          },
+          aiText && md(aiText),
+          aiLines.length > LINES && (
+            <Button key="analysis-more" label={showAll ? 'Prikaži manje' : `Prikaži sve (još ${aiLines.length - LINES} redova)`} plain dimColor onPress={() => void setOpen($, 'analysis-full', !showAll)} />
+          ),
+          r?.aiNote && k.note(r.aiNote, 'warn'),
+          r && r.tips.length > 0 && (
+            <Box flexDirection="column" gap="xs">
+              {k.label('Uočeno u statistici')}
+              {md(r.tips.map(x => `- ${x}`).join('\n'))}
+            </Box>
+          ),
+          r && !r.ai && r.tips.length === 0 && k.note('Nema uočenih odstupanja. Potrošnja je u očekivanim granicama.'),
         ),
         k.note('Taster u kućici na dugmetu ga pokreće dok je Kokpit u fokusu.'),
       )
@@ -793,6 +1066,8 @@ export const register: Register = (on, options) => {
       const hv = await read($, heavy)
       const reps = (await read($, repeats)).filter(x => x.count > 1).sort((a, z) => z.count - a.count)
       const mcp = mcpReport(b, await read($, tools), await loadHistory($))
+      const unused = mcp.unused.filter(x => !BUILTIN_MCP.test(x))
+      const unusedOpen = await isOpen($, 'unused', false)
       return page(
         k.card(
           {
@@ -825,18 +1100,104 @@ export const register: Register = (on, options) => {
         k.card(
           {
             title: 'MCP serveri',
-            description: mcp.issues ? `${mcp.issues} ${plural(mcp.issues, 'napomena', 'napomene', 'napomena')}` : 'Učitani u kontekst',
+            description: mcp.loaded.length ? `Učitani u kontekst: ${mcp.loaded.length}` : 'Brojke se pojavljuju nakon klika na Osvježi.',
             action: <Button key="act-mcp-open" label="Upravljaj" variant="secondary" onPress={() => runCommand($, 'mcp')} />,
           },
-          ...mcp.duplicates.map(d => k.note(`Duplikat: ${serverLabel(d.a)} i ${serverLabel(d.b)} dijele ${d.shared} alata. Jedan se može isključiti.`, 'warn')),
-          mcp.unused.length > 0 && k.note(`Nekorišteni u zadnjih ${mcp.sessions} sesija: ${mcp.unused.map(serverLabel).join(', ')}`, 'warn'),
+          ...mcp.duplicates.map(d =>
+            k.row({ title: <Text><Text color={TONE_TEXT.warn}>Duplikat </Text>{serverLabel(d.a)} = {serverLabel(d.b)}</Text>, sub: 'Isti alati u oba; jedan se može isključiti.', right: k.value(`${d.shared} alata`, 'warn') }),
+          ),
           ...mcp.loaded.map(x => k.row({ title: x.label, right: k.value(x.note) })),
-          mcp.loaded.length === 0 && k.note('Brojke se pojavljuju nakon klika na Osvježi.'),
+          unused.length > 0 && (
+            <Box flexDirection="column" gap="xs">
+              <Button key="fold-unused" plain dimColor onPress={() => void setOpen($, 'unused', !unusedOpen)}>
+                {unusedOpen ? '▾ ' : '▸ '}Nekorišteni u zadnjih {mcp.sessions} sesija · {unused.length}
+              </Button>
+              {unusedOpen && k.note(unused.map(serverLabel).sort((a, z) => a.localeCompare(z)).join(' · '))}
+            </Box>
+          ),
         ),
       )
     }
 
-    if (v === 'artefakti') {
+    if (v === 'prompt') {
+      const draft = await read($, promptDraft)
+      const withCtx = await read($, promptCtx)
+      const stage = await read($, promptStage)
+      const qs = await read($, promptQuestions)
+      const as = await read($, promptAnswers)
+      const result = await read($, promptResult)
+      const err = await read($, promptError)
+      const pm = await chosen($, 'prompt')
+      const isBusy = stage === 'busy'
+      const rev = await read($, promptReview)
+      const rBusy = await read($, reviewBusy)
+      const scope = await read($, reviewScope)
+      const reviewOpen = await isOpen($, 'review', false)
+      return page(
+        k.card(
+          { title: 'Zahtjev', description: 'Opiši šta želiš uraditi; model predloži prompt, a ako nešto nije jasno, prvo pita.' },
+          Input ? (
+            <Input key="prompt-draft" rows={4} placeholder="npr. Dodaj izvoz izvještaja u PDF…" value={draft} submitLabel="Predloži" onInput={x => void update($, promptDraft, () => x)} onSubmit={x => void update($, promptDraft, () => x).then(() => resetPrompt($)).then(() => suggestPrompt($, false))} />
+          ) : (
+            k.note('Upis zahtjeva radi u aplikaciji na računaru i u terminalu.')
+          ),
+          <Box justifyContent="space-between" alignItems="center" gap="sm" flexWrap="wrap">
+            <Button key="prompt-ctx" plain dimColor={!withCtx} onPress={() => void update($, promptCtx, x => !x)}>
+              {withCtx ? '☑' : '☐'} Uključi dosadašnji razgovor
+            </Button>
+            {k.btn({ key: 'prompt-run', text: isBusy ? 'Radim…' : 'Predloži prompt', variant: 'primary', onPress: () => (isBusy ? undefined : void resetPrompt($).then(() => suggestPrompt($, false))) })}
+          </Box>,
+          isBusy && k.note(`Model ${pm.model} (${pm.effort}) ${qs.length ? 'piše prompt' : 'razmatra zahtjev'}…`),
+          err && k.note(err, 'bad'),
+        ),
+        stage === 'questions' &&
+          k.card(
+            { title: 'Prvo nekoliko pitanja', description: 'Odgovori na ono što znaš; prazno polje znači da model odluči sam.' },
+            ...qs.map((q, i) => (
+              <Box flexDirection="column" gap="xs">
+                <Text wrap="wrap">{q}</Text>
+                {Input && <Input key={`prompt-a-${i}`} value={as[i] ?? ''} placeholder="Odgovor" submitLabel="OK" onInput={x => void update($, promptAnswers, l => l.map((y, j) => (j === i ? x : y)))} onSubmit={x => void update($, promptAnswers, l => l.map((y, j) => (j === i ? x : y)))} />}
+              </Box>
+            )),
+            <Box gap="xs">
+              {k.btn({ key: 'prompt-continue', text: 'Nastavi', variant: 'primary', onPress: () => void suggestPrompt($, true) })}
+              <Button key="prompt-skip" label="Preskoči pitanja" plain dimColor onPress={() => void suggestPrompt($, true)} />
+            </Box>,
+          ),
+        stage === 'done' &&
+          result &&
+          k.card(
+            {
+              title: 'Prijedlog prompta',
+              action: (
+                <Box gap="xs">
+                  {k.btn({ key: 'prompt-use', text: 'Ubaci u unos', variant: 'primary', onPress: () => void $.prompt.fill({ text: result }).then(() => $.ui.toast('Prompt je u polju za unos; provjeriti pa Enter.')) })}
+                  <Button key="prompt-again" label="Ispočetka" plain dimColor onPress={() => void resetPrompt($)} />
+                </Box>
+              ),
+            },
+            Markdown ? <Markdown text={result} /> : <Text wrap="wrap">{result}</Text>,
+          ),
+        k.card(
+          {
+            title: 'Analiza mojih promptova',
+            fold: { key: 'fold-review', open: reviewOpen, toggle: () => void setOpen($, 'review', !reviewOpen) },
+            description: rBusy ? `Model ${pm.model} (${pm.effort}) čita promptove…` : rev ? `${rev.count} ${plural(rev.count, 'prompt', 'prompta', 'promptova')} · ${rev.scope === 'sesija' ? 'ova sesija' : 'zadnji razgovori projekta'} · ${hhmm(rev.at)}` : 'Model pregleda kako pišeš promptove i predloži šta poboljšati.',
+            action: k.btn({ key: 'review-run', text: rBusy ? 'Radim…' : rev ? 'Ponovi' : 'Analiziraj', variant: rev ? 'secondary' : 'primary', onPress: () => (rBusy ? undefined : void reviewPrompts($, scope)) }),
+          },
+          <Box gap="xs" alignItems="center">
+            {k.label('Opseg:')}
+            {(['sesija', 'projekat'] as const).map(x =>
+              k.btn({ key: `review-scope-${x}`, text: x === 'sesija' ? 'Ova sesija' : 'Zadnjih 10 razgovora projekta', plain: scope !== x, onPress: () => void update($, reviewScope, () => x) }),
+            )}
+          </Box>,
+          rev?.text && md(rev.text),
+          rev?.note && k.note(rev.note, 'warn'),
+        ),
+      )
+    }
+
+    if (v === 'postavke') {
       const list = await read($, pins)
       const name = projectName(await read($, project))
       const lib = await read($, library)
@@ -848,16 +1209,17 @@ export const register: Register = (on, options) => {
       const free = (lib ?? []).filter(x => !pinned.has(x.url))
       const matching = q ? free.filter(x => x.title.toLowerCase().includes(q)) : free
       const SHOWN = 8
+      const cm = await chosen($, 'compact')
+      const am = await chosen($, 'analysis')
+      const pm = await chosen($, 'prompt')
       const remove = (url: string) => void setHidden($, url, true).then(() => savePins($, l => l.filter(y => y.url !== url)))
       const startAdding = (m: 'lib' | 'link') => {
         void update($, adding, () => (mode === m ? null : m))
         if (m === 'lib' && lib == null) void loadLibrary($)
       }
-
-      // Jedan pin je jedan red: klik na naziv otvara artefakt, × ga uklanja.
       const pinRow = (x: Pin, i: number) => (
         <Box justifyContent="space-between" alignItems="center" gap="sm">
-          <Button key={`pin-open-${i}`} hotkey={i < 9 ? String(i + 1) : undefined} plain onPress={() => void openArtifact($, x.url)}>
+          <Button key={`pin-open-${i}`} plain onPress={() => void openArtifact($, x.url)}>
             {x.title}
           </Button>
           <Box gap="xs" flexShrink={0}>
@@ -866,43 +1228,56 @@ export const register: Register = (on, options) => {
           </Box>
         </Box>
       )
-      const addRow = (x: Pin, key: string) =>
-        k.row({ title: x.title, right: k.btn({ key, text: '+ Pinuj', onPress: () => void pinUrl($, x.url, x.title) }) })
+      const addRow = (x: Pin, key: string) => k.row({ title: x.title, right: k.btn({ key, text: '+ Pinuj', onPress: () => void pinUrl($, x.url, x.title) }) })
 
       return page(
         k.card(
-          { title: name === 'sesija bez foldera' ? 'Artefakti ove sesije' : `Artefakti · ${name}`, description: list.length ? 'Klik na naziv otvara artefakt; lista je ista u svakoj sesiji ovog projekta.' : undefined },
-          list.length === 0 && k.note(isLinking ? 'Tražim artefakte iz ranijih razgovora ovog projekta…' : 'Još nema artefakata. Oni iz ranijih razgovora ovog projekta dodaju se sami, a ostale dodaj ispod.'),
-          ...list.map(pinRow),
+          { title: 'Modeli', description: 'Model i napor za Smart compact, AI analizu i Prompt; važi za sve sesije.' },
+          ...(['compact', 'analysis', 'prompt'] as const).map(which => {
+            const c = which === 'compact' ? cm : which === 'analysis' ? am : pm
+            const label = which === 'compact' ? 'Smart compact' : which === 'analysis' ? 'AI analiza' : 'Prompt'
+            return Select ? (
+              <Box alignItems="center" justifyContent="space-between" gap="sm" flexWrap="wrap">
+                <Text>{label}</Text>
+                <Box gap="xs" flexShrink={0}>
+                  <Select key={`set-${which}-model`} value={c.model} options={MODELS.map(x => ({ value: x }))} onSelect={x => void setChoice($, which, { model: x })} />
+                  <Select key={`set-${which}-effort`} value={c.effort} options={EFFORTS.map(x => ({ value: x }))} onSelect={x => void setChoice($, which, { effort: EFFORTS.find(y => y === x) ?? 'medium' })} />
+                </Box>
+              </Box>
+            ) : (
+              k.row({ title: label, right: k.value(`${c.model} · ${c.effort}`) })
+            )
+          }),
         ),
-        suggested.length > 0 &&
-          k.card({ title: 'Iz ove sesije', description: 'Artefakti koje je Claude objavio ili otvorio u ovom razgovoru.' }, ...suggested.map((x, i) => addRow(x, `recent-pin-${i}`))),
-        <Box gap="xs" marginBottom="sm" flexWrap="wrap">
-          {k.btn({ key: 'add-lib', text: '+ Iz biblioteke', variant: mode === 'lib' ? 'primary' : 'secondary', onPress: () => startAdding('lib') })}
-          {k.btn({ key: 'add-link', text: '+ Link', variant: mode === 'link' ? 'primary' : 'secondary', onPress: () => startAdding('link') })}
-          <Button key="link-project" label={isLinking ? 'Povezujem…' : 'Ponovo poveži iz projekta'} plain dimColor onPress={() => (isLinking ? undefined : void linkProject($).then(n => (n ? undefined : $.ui.toast('Nema novih artefakata iz ovog projekta.'))))} />
-        </Box>,
-        mode === 'lib' &&
-          k.card(
-            { title: 'Biblioteka' },
-            lib == null
-              ? k.note('Učitavam tvoje artefakte…')
-              : Input
-                ? <Input key="lib-search" placeholder="Traži po nazivu" value={q} submitLabel="Traži" onInput={x => void update($, libQuery, () => x)} onSubmit={x => void update($, libQuery, () => x)} />
-                : null,
-            ...matching.slice(0, SHOWN).map((x, i) => addRow(x, `lib-pin-${i}`)),
-            lib != null && matching.length === 0 && k.note(free.length ? 'Nijedan artefakt ne odgovara pretrazi.' : 'Svi artefakti iz biblioteke su već pinovani.'),
-            matching.length > SHOWN && k.note(`Još ${matching.length - SHOWN}; upiši dio naziva da suziš listu.`),
+        k.card(
+          {
+            title: name === 'sesija bez foldera' ? 'Artefakti ove sesije' : `Artefakti · ${name}`,
+            description: list.length ? 'Prikazuju se na Pregledu i u traci; ↑ mijenja redoslijed, × uklanja.' : isLinking ? 'Tražim artefakte iz ranijih razgovora ovog projekta…' : 'Još nema artefakata; oni iz ranijih razgovora projekta dodaju se sami.',
+            action: (
+              <Box gap="xs">
+                {k.btn({ key: 'add-lib', text: '+ Biblioteka', variant: mode === 'lib' ? 'primary' : 'secondary', onPress: () => startAdding('lib') })}
+                {k.btn({ key: 'add-link', text: '+ Link', variant: mode === 'link' ? 'primary' : 'secondary', onPress: () => startAdding('link') })}
+              </Box>
+            ),
+          },
+          mode === 'lib' && (
+            <Box flexDirection="column" gap="xs" borderStyle="round" borderDimColor paddingX="md" paddingY="xs">
+              {lib == null ? k.note('Učitavam tvoje artefakte…') : Input ? <Input key="lib-search" placeholder="Traži u biblioteci" value={q} submitLabel="Traži" onInput={x => void update($, libQuery, () => x)} onSubmit={x => void update($, libQuery, () => x)} /> : null}
+              {matching.slice(0, SHOWN).map((x, i) => addRow(x, `lib-pin-${i}`))}
+              {lib != null && matching.length === 0 ? k.note(free.length ? 'Nijedan artefakt ne odgovara pretrazi.' : 'Svi artefakti iz biblioteke su već pinovani.') : null}
+              {matching.length > SHOWN ? k.note(`Još ${matching.length - SHOWN}; upiši dio naziva da suziš listu.`) : null}
+            </Box>
           ),
-        mode === 'link' &&
-          k.card(
-            { title: 'Dodaj link' },
-            Input ? (
+          mode === 'link' &&
+            (Input ? (
               <Input key="pin-add" placeholder="https://claude.ai/artifact/…" value="" submitLabel="Pinuj" autoFocus onSubmit={x => void pinUrl($, x).then(() => update($, adding, () => null))} />
             ) : (
               k.note('U terminalu: /kokpit-pin <link> [naziv]')
-            ),
-          ),
+            )),
+          ...list.map(pinRow),
+          ...suggested.map((x, i) => addRow({ ...x, title: `${x.title} · iz ove sesije` }, `recent-pin-${i}`)),
+          <Button key="link-project" label={isLinking ? 'Povezujem…' : 'Ponovo poveži iz projekta'} plain dimColor onPress={() => (isLinking ? undefined : void linkProject($).then(n => (n ? undefined : $.ui.toast('Nema novih artefakata iz ovog projekta.'))))} />,
+        ),
       )
     }
 

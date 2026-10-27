@@ -51,7 +51,15 @@ export type Breakdown = {
   at: number
 }
 
-export type View = 'sesija' | 'potrosnja' | 'troskovi' | 'artefakti'
+export type View = 'sesija' | 'potrosnja' | 'troskovi' | 'postavke' | 'prompt'
+
+export type ModelChoice = { model: string; effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
+
+export type ModelChoices = { compact?: ModelChoice; analysis?: ModelChoice; prompt?: ModelChoice }
+
+export type PromptReview = { text: string | null; note: string | null; at: number; count: number; scope: 'sesija' | 'projekat' }
+
+export type PromptStage = 'idle' | 'busy' | 'questions' | 'done'
 
 export type Pin = { url: string; title: string; at: number }
 
@@ -109,6 +117,19 @@ declare module 'claude-code' {
       adding: 'lib' | 'link' | null
       pickNonce: number
       opened: string[]
+      models: ModelChoices
+      promptDraft: string
+      promptCtx: boolean
+      promptStage: PromptStage
+      promptQuestions: string[]
+      promptAnswers: string[]
+      promptResult: string | null
+      promptError: string | null
+      folds: Record<string, boolean>
+      cacheTick: number
+      promptReview: PromptReview | null
+      reviewBusy: boolean
+      reviewScope: 'sesija' | 'projekat'
     }
   }
 }

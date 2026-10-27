@@ -36,18 +36,30 @@ export const kit = (els: ElementTable, columns: number) => {
   const stack = (parts: readonly { value: number; color: string }[], total: number) =>
     Svg ? <Svg source={stackSvg(parts, total)} alt="Sastav konteksta" height={10} /> : null
 
-  const card = (o: { title: string; description?: string; action?: Child; tone?: Tone }, ...body: Child[]) => (
-    <Box flexDirection="column" borderStyle="round" borderDimColor={!o.tone} borderColor={o.tone ? TONE_TEXT[o.tone] : undefined} paddingX="md" paddingY="sm" gap="xs" marginBottom="sm">
-      <Box justifyContent="space-between" alignItems="center" gap="sm">
-        <Box flexDirection="column" flexShrink={1}>
-          <Text weight="semibold" color={o.tone ? TONE_TEXT[o.tone] : undefined}>{o.title}</Text>
-          {o.description ? note(o.description) : null}
+  // Kartica; s `fold` naslov postaje dugme koje je skuplja i širi (sadržaj se tada ne crta).
+  const card = (o: { title: string; description?: string; action?: Child; tone?: Tone; fold?: { key: string; open: boolean; toggle: () => void } }, ...body: Child[]) => {
+    const color = o.tone ? TONE_TEXT[o.tone] : undefined
+    const isOpen = !o.fold || o.fold.open
+    return (
+      <Box flexDirection="column" borderStyle="round" borderDimColor={!o.tone} borderColor={color} paddingX="md" paddingY="sm" gap="xs" marginBottom="sm">
+        <Box justifyContent="space-between" alignItems="center" gap="sm">
+          <Box flexDirection="column" flexShrink={1}>
+            {o.fold ? (
+              <Button key={o.fold.key} plain onPress={o.fold.toggle}>
+                <Text dimColor>{isOpen ? '▾ ' : '▸ '}</Text>
+                <Text weight="semibold" color={color}>{o.title}</Text>
+              </Button>
+            ) : (
+              <Text weight="semibold" color={color}>{o.title}</Text>
+            )}
+            {o.description ? note(o.description) : null}
+          </Box>
+          {o.action || null}
         </Box>
-        {o.action || null}
+        {isOpen ? kids(body) : null}
       </Box>
-      {kids(body)}
-    </Box>
-  )
+    )
+  }
 
   // Mjerač u jednom redu: natpis lijevo, vrijednost desno, traka i jedan red objašnjenja ispod.
   const gauge = (o: { title: string; value: string; tone: Tone; percent: number | null; sub?: string; hint?: string; hintTone?: Tone }) => (
