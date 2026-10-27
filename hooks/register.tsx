@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderElement } from 'claude-code'
+import type { EngineInterface, ModelEffort, Register, RenderElement } from 'claude-code'
 
 import type { Breakdown, Budget, Pin, Report, HeavyCall, LimitSample, Measure, RepeatRead, SessionRecord, StepUsage, ToolStat, View, Warned } from '../types'
 import { analyze, byProject, byWeek, forecast, fmt, hitRate, limitName, mcpDuplicates, normServer, pct, periodStart, plural, resetText, serverLabel, serverOfTool, spent, tok, toolLabel, totals, usd } from './lib'
@@ -114,8 +114,9 @@ const analysisBody = async ($: EngineInterface, ai: boolean, pragAlata: number) 
       .join('\n')
     const heavyList = data.heavy.slice(-8).map(x => `- ${x.tool} ~${fmt(tok(x.chars))} tok: ${x.label}`).join('\n')
     const r = await $.model.complete({
-      model: 'haiku',
-      maxTokens: 700,
+      model: analysisModel.model,
+      effort: analysisModel.effort,
+      maxTokens: 8000,
       system:
         'Pišeš stručni izvještaj o potrošnji tokena u Claude Code sesiji. Jezik: standardni bosanski, ijekavica. Ton: profesionalan, neutralan i sažet, kao tehnička dokumentacija. Koristi bezlične konstrukcije i ne pretpostavljaj rod korisnika. Ne komentariši ton, raspoloženje ni zadovoljstvo korisnika. Ne obraćaj se čitaocu uzvicima i ne ponavljaj tabelu iz ulaza. Markdown, bez naslova prvog nivoa.',
       prompt: `Statistika sesije:\n${local.markdown}\n\nNajveći pojedinačni rezultati alata:\n${heavyList || '- nema'}\n\nZadnje poruke korisnika:\n${prompts || '- nema'}\n\nNapiši tri kratka dijela s naslovima drugog nivoa: „Pregled“ (dvije do tri rečenice: tema sesije i glavni izvori potrošnje), „Preporuke“ (najviše četiri stavke, svaka konkretna i vezana za ovu sesiju) i „Naredni korak“ (jedna rečenica: nastaviti, kompaktirati ili otvoriti novu sesiju, uz razlog).`,
@@ -130,11 +131,11 @@ const analysisBody = async ($: EngineInterface, ai: boolean, pragAlata: number) 
 
 // Redoslijed je redoslijed prikaza; Novi zadatak je zadnji jer briše razgovor.
 const ACTIONS = [
-  { id: 'compact', key: 's', title: 'Sažmi razgovor', desc: 'Zamjenjuje razgovor sažetkom i oslobađa kontekst.', button: 'Sažmi' },
-  { id: 'compact-upute', key: 'p', title: 'Pametno sažimanje', desc: 'Model predloži šta sažetak mora zadržati; provjeriti pa Enter.', button: 'Pripremi' },
-  { id: 'mcp', key: 'm', title: 'MCP serveri', desc: 'Isključeni serveri ne opterećuju kontekst.', button: 'Otvori' },
-  { id: 'model', key: 'o', title: 'Promjena modela', desc: 'Usred zadatka poništava keš.', button: 'Promijeni' },
-  { id: 'clear', key: 'n', title: 'Novi zadatak', desc: 'Briše razgovor i počinje ispočetka u istom folderu.', button: 'Obriši' },
+  { id: 'compact', key: 's', title: 'Compact', desc: 'Claude Code sam sažme razgovor (/compact) i oslobodi kontekst, bez posebnih uputa.', button: 'Compact' },
+  { id: 'compact-upute', key: 'p', title: 'Smart compact', desc: 'Model prvo predloži šta sažetak mora zadržati i upiše /compact s tim uputama; provjeriti pa Enter.', button: 'Prepare' },
+  { id: 'mcp', key: 'm', title: 'MCP serveri', desc: 'Uključivanje i isključivanje servera; isključeni ne opterećuju kontekst.', button: 'Otvori' },
+  { id: 'model', key: 'o', title: 'Promjena modela', desc: 'Izbor modela; promjena usred zadatka poništava keš.', button: 'Promijeni' },
+  { id: 'clear', key: 'n', title: 'New task', desc: 'Briše razgovor (/clear) i počinje ispočetka u istom folderu.', button: 'Clear' },
 ] as const
 
 type ActionId = (typeof ACTIONS)[number]['id']
@@ -168,23 +169,34 @@ const runAction = async ($: EngineInterface, id: ActionId) => {
 }
 
 // Iz zadnjih poruka i fajlova sesije model sastavlja upute za /compact; bez modela ostaje prazan predložak.
+const EFFORTS: readonly ModelEffort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+// Postavlja se iz userConfig pri učitavanju moda.
+let compactModel: { model: string; effort: ModelEffort } = { model: 'opus', effort: 'medium' }
+let analysisModel: { model: string; effort: ModelEffort } = { model: 'opus', effort: 'medium' }
+const modelOf = (model: unknown, effort: unknown) => ({
+  model: typeof model === 'string' && model ? model : 'opus',
+  effort: EFFORTS.find(x => x === effort) ?? 'medium',
+})
+
 const smartCompact = async ($: EngineInterface) => {
-  $.ui.toast('Pripremaju se upute za sažimanje…', { timeoutMs: 3000 })
+  const cm = compactModel
+  $.ui.toast(`Model ${cm.model} (${cm.effort}) priprema upute za sažimanje…`, { timeoutMs: 15000 })
   const prompts = (await $.session.messages())
     .filter(m => m.role === 'user' && m.text.trim())
     .slice(-8)
-    .map(m => `- ${m.text.replace(/\s+/g, ' ').slice(0, 300)}`)
+    .map(m => `- ${m.text.replace(/\s+/g, ' ').slice(0, 800)}`)
     .join('\n')
   const files = [...(await read($, repeats))].slice(-15).map(r => `- ${r.path}`).join('\n')
   let keep = ''
   if (prompts) {
     const r = await $.model.complete({
-      model: 'haiku',
-      maxTokens: 200,
+      model: cm.model,
+      effort: cm.effort,
+      maxTokens: 8000,
       system: 'Sastavljaš upute za sažimanje Claude Code razgovora. Odgovor je jedna linija na bosanskom, ijekavica, bez uvoda i navodnika: nabrajanje, odvojeno tačka-zarezom, onoga što sažetak mora zadržati: trenutni zadatak, donesene odluke, otvorena pitanja i ključne fajlove s putanjama.',
       prompt: `Zadnje poruke korisnika:\n${prompts}\n\nFajlovi korišteni u sesiji:\n${files || '- nema'}`,
     }).catch(() => null)
-    if (r?.isAnswered) keep = r.text.replace(/\s+/g, ' ').trim().slice(0, 600)
+    if (r?.isAnswered) keep = r.text.replace(/\s+/g, ' ').trim()
   }
   await $.prompt.fill({ text: `/compact Zadržati: ${keep}` })
   $.ui.toast(keep ? 'Upute za sažimanje su upisane u polje za unos. Provjeriti pa pritisnuti Enter.' : 'Model nije dostupan. Upisati šta sažetak mora zadržati pa pritisnuti Enter.', { timeoutMs: 6000 })
@@ -235,8 +247,8 @@ const statusOf = async ($: EngineInterface, id: string | null, now: number): Pro
   const p = m?.percent ?? null
   const found: { rank: number; title: string; advice: string; text: string; color: string; fix?: Fix }[] = []
   const go = (v: View): Fix => ({ label: 'Detalji', run: () => update($, view, () => v) })
-  if (p != null && p >= 80) found.push({ rank: 9, title: 'Kontekst skoro pun', advice: 'Sažeti razgovor ili početi novi zadatak.', text: `Kontekst je popunjen ${p} %. Svaki zahtjev ga šalje u cijelosti.`, color: C.red, fix: { label: 'Pametno sažimanje', run: () => smartCompact($) } })
-  else if (p != null && p >= 60) found.push({ rank: 5, title: 'Kontekst se puni', advice: 'Uskoro sažeti razgovor (Pametno sažimanje).', text: `Kontekst je popunjen ${p} %.`, color: C.amber, fix: { label: 'Pametno sažimanje', run: () => smartCompact($) } })
+  if (p != null && p >= 80) found.push({ rank: 9, title: 'Kontekst skoro pun', advice: 'Sažeti razgovor ili početi novi zadatak.', text: `Kontekst je popunjen ${p} %. Svaki zahtjev ga šalje u cijelosti.`, color: C.red, fix: { label: 'Smart compact', run: () => smartCompact($) } })
+  else if (p != null && p >= 60) found.push({ rank: 5, title: 'Kontekst se puni', advice: 'Uskoro sažeti razgovor (Smart compact).', text: `Kontekst je popunjen ${p} %.`, color: C.amber, fix: { label: 'Smart compact', run: () => smartCompact($) } })
   for (const r of budgetRows(await read($, budget), await loadHistory($), id, m?.usd ?? null, now)) {
     if (r.percent >= 80)
       found.push({ rank: r.percent >= 100 ? 7 : 3, title: r.percent >= 100 ? 'Budžet potrošen' : 'Budžet pri kraju', advice: `${r.label}: ${r.hint}.`, text: `${r.label}: potrošeno ${r.hint}.`, color: r.percent >= 100 ? C.red : C.amber, fix: go('troskovi') })
@@ -375,6 +387,8 @@ const togglePane = async ($: EngineInterface) => {
 export const register: Register = (on, options) => {
   const pragAlata = typeof options.pragAlata === 'number' ? options.pragAlata : 8000
   const ai = options.ai !== false
+  compactModel = modelOf(options.sazimanjeModel, options.sazimanjeNapor)
+  analysisModel = modelOf(options.analizaModel, options.analizaNapor)
   let sessionStart = 0
   let sessionId: string | null = null
 
@@ -668,7 +682,7 @@ export const register: Register = (on, options) => {
               }}
             />
           )}
-          {p != null && p >= 60 && <Button key="band-compact" label="Sažmi" variant="primary" onPress={() => runCommand($, 'compact')} />}
+          {p != null && p >= 60 && <Button key="band-compact" label="Compact" variant="primary" onPress={() => runCommand($, 'compact')} />}
           <Button key="band-open" label="◔ Kokpit" variant="secondary" onPress={() => togglePane($)} />
         </Box>
       </Box>
@@ -742,7 +756,7 @@ export const register: Register = (on, options) => {
         k.card(
           {
             title: 'Analiza sesije',
-            description: isBusy ? 'Model čita statistiku i zadnje poruke…' : r ? `Zadnja analiza u ${hhmm(r.at)}` : 'Model pregleda potrošnju i predloži šta promijeniti.',
+            description: isBusy ? `Model ${analysisModel.model} (${analysisModel.effort}) čita statistiku i zadnje poruke…` : r ? `Zadnja analiza u ${hhmm(r.at)}` : 'Model pregleda potrošnju i predloži šta promijeniti.',
             action: k.btn({ key: 'run', text: isBusy ? 'Analiza u toku…' : r ? 'Ponovi' : 'Analiziraj', hotkey: 'a', variant: r ? 'secondary' : 'primary', onPress: () => (isBusy ? undefined : void runAnalysis($, ai, pragAlata)) }),
           },
           r?.ai && md(r.ai),
@@ -762,7 +776,7 @@ export const register: Register = (on, options) => {
             return k.row({
               title: <Text weight="medium" color={x.id === 'clear' ? 'error' : undefined}>{x.title}</Text>,
               sub: armed ? 'Drugi klik briše razgovor.' : x.desc,
-              right: k.btn({ key: `act-${x.id}`, text: armed ? 'Potvrdi' : x.button, hotkey: x.key, variant: x.id === rec || armed ? 'primary' : 'secondary', onPress: () => void runAction($, x.id) }),
+              right: k.btn({ key: `act-${x.id}`, text: armed ? 'Confirm' : x.button, hotkey: x.key, variant: x.id === rec || armed ? 'primary' : 'secondary', onPress: () => void runAction($, x.id) }),
             })
           }),
         ),

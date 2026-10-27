@@ -15,6 +15,54 @@
       "description": "Da li /analiza zove Haiku za sažetak i preporuke",
       "default": true,
       "title": "AI sažetak u /analiza"
+    },
+    "analizaModel": {
+      "type": "string",
+      "title": "Model za AI analizu",
+      "description": "Model koji piše procjenu i preporuke u analizi sesije",
+      "options": [
+        "opus",
+        "sonnet",
+        "haiku"
+      ],
+      "default": "opus"
+    },
+    "analizaNapor": {
+      "type": "string",
+      "title": "Napor za AI analizu",
+      "description": "Koliko model razmišlja prije procjene",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "medium"
+    },
+    "sazimanjeModel": {
+      "type": "string",
+      "title": "Model za pametno sažimanje",
+      "description": "Model koji predlaže šta sažetak mora zadržati",
+      "options": [
+        "opus",
+        "sonnet",
+        "haiku"
+      ],
+      "default": "opus"
+    },
+    "sazimanjeNapor": {
+      "type": "string",
+      "title": "Napor za pametno sažimanje",
+      "description": "Koliko model razmišlja prije prijedloga",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "medium"
     }
   }
 }

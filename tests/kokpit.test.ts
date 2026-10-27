@@ -181,3 +181,19 @@ test('drugo otvaranje istog artefakta ide u preglednik', async ($, on) => {
   await desk.press({ key: 'pin-open-0' })
   expect(calls).toEqual(['panel', 'open'])
 })
+
+test('pametno sažimanje koristi model iz postavki i ne siječe upute', { options: { sazimanjeModel: 'opus', sazimanjeNapor: 'medium' } }, async ($, on) => {
+  mock.clock(on)
+  mock.store(on)
+  const long = Array.from({ length: 60 }, (_, i) => `stavka ${i}`).join('; ')
+  const asked: { model: string; effort?: string; maxTokens?: number }[] = []
+  let filled = ''
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'Radimo na Kokpitu' }] }) as never)
+  on('model.complete', (_$, e) => (asked.push({ model: e.model, effort: e.effort, maxTokens: e.maxTokens }), { value: { isAnswered: true, text: long, usage: { input_tokens: 1, output_tokens: 1 } } }) as never)
+  on('ui.toast', () => ({ value: undefined }))
+  on('prompt.fill', (_$, e) => ((filled = (e as { text: string }).text), { isFilled: true }) as never)
+  const desk = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...PANE })
+  await desk.press({ key: 'act-compact-upute' })
+  expect(asked[0]).toEqual({ model: 'opus', effort: 'medium', maxTokens: 8000 })
+  expect(filled).toBe(`/compact Zadržati: ${long}`)
+})
