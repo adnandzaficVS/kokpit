@@ -385,7 +385,17 @@ const seedResumed = async ($: EngineInterface, id: string) => {
     }))
   if ((await read($, steps)).length) return
   const r = await $.process
-    .run(['/bin/sh', '-c', 'f=$(ls "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1); [ -n "$f" ] && tail -n 400 "$f" | grep \'"type":"assistant"\' | tail -1', 'sh', id], { timeoutMs: 10000 })
+    .run(
+      [
+        '/bin/sh',
+        '-c',
+        'f=$(ls "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1); [ -z "$f" ] && f=$(ls -t "$HOME"/.claude/projects/"$2"/*.jsonl 2>/dev/null | head -1); [ -n "$f" ] && tail -n 400 "$f" | grep \'"type":"assistant"\' | grep -v \'"isSidechain":true\' | tail -1',
+        'sh',
+        id,
+        (await $.session.cwd()).replace(/[^A-Za-z0-9]/g, '-'),
+      ],
+      { timeoutMs: 10000 },
+    )
     .catch(() => null)
   try {
     const o = JSON.parse(r?.stdout.trim() || 'null') as { timestamp?: string; message?: { model?: string; usage?: Record<string, number> } } | null
@@ -614,12 +624,14 @@ export const register: Register = (on, options) => {
   promptModel = modelOf(options.promptModel, options.promptNapor)
   let sessionStart = 0
   let sessionId: string | null = null
+  let seeded = false
 
   on('session.start', async ($, e, next) => {
     sessionStart = await $.clock.now()
     sessionId = await $.session.id()
     // Odbrojavanje keša u traci treba novo crtanje i kad se ništa drugo ne dešava.
     void $.clock.every(15_000, () => void update($, cacheTick, n => n + 1))
+    seeded = true
     void seedResumed($, sessionId).catch(() => undefined)
     const sv = await $.store.get('samples')
     if (Array.isArray(sv)) await update($, samples, () => (sv as LimitSample[]).filter(x => sessionStart - x.at < 3 * 3600_000))
@@ -876,6 +888,11 @@ export const register: Register = (on, options) => {
     const pinned = await read($, pins)
     const nonce = await read($, pickNonce)
     await read($, cacheTick)
+    // Ponovni pokušaj iz trake, ako je session.start bio prerano ili ga nije bilo.
+    if (!seeded && sessionId) {
+      seeded = true
+      void seedResumed($, sessionId).catch(() => undefined)
+    }
     const cache = cacheState(await read($, steps), cacheTtl, await $.clock.now())
 
     // Traka pokazuje ono što ograničava rad: 5 h i 7 d uvijek, ostale limite i budžet tek kad pređu 80 %.
@@ -890,16 +907,19 @@ export const register: Register = (on, options) => {
         <Text weight="semibold" tabular color={tone === 'muted' ? undefined : TONE_TEXT[tone]}>{value}</Text>
       </Box>
     )
-    // Široka traka: brojke lijevo, dugmad desno. Uska traka i telefon: brojke u prvom redu, dugmad u drugom.
+    // Desktop sam prelama red kad nema mjesta; uzak terminal i telefon slažu dugmad u drugi red.
     const cols = e.props.bodyColumns
-    const stacked = cols < 90 || e.surface === 'mobile'
-    const metrics = (
+    const stacked = e.surface === 'mobile' || (e.surface === 'terminal' && cols < 90)
+    const known = p != null || limits.length > 0 || cache.tone !== 'muted' || m?.usd != null
+    const metrics = known ? (
       <Box alignItems="center" gap="md" flexShrink={1} flexWrap="wrap">
         {item('Kontekst', pctText(p), toneOf(p))}
         {limits.map(l => item(l.label, pctText(l.percent), toneOf(l.percent)))}
         {item('Keš', cache.value, cache.tone)}
-        {cols >= 60 && item('Trošak', usd(m?.usd), 'muted')}
+        {(e.surface !== 'terminal' || cols >= 60) && item('Trošak', usd(m?.usd), 'muted')}
       </Box>
+    ) : (
+      <Text size="footnote" dimColor>Brojke se pojavljuju nakon prve poruke u ovoj sesiji.</Text>
     )
     const actions = (
       <Box alignItems="center" gap="sm" flexShrink={0} flexWrap="wrap">
@@ -915,7 +935,7 @@ export const register: Register = (on, options) => {
             }}
           />
         )}
-        {p != null && p >= 60 && <Button key="band-compact" label={cols < 70 ? '✦ Smart' : '✦ Smart compact'} variant="primary" onPress={() => void smartCompact($)} />}
+        {p != null && p >= 60 && <Button key="band-compact" label={e.surface !== 'desktop' && cols < 70 ? '✦ Smart' : '✦ Smart compact'} variant="primary" onPress={() => void smartCompact($)} />}
         <Button key="band-open" label="◔ Kokpit" variant="secondary" onPress={() => togglePane($)} />
       </Box>
     )

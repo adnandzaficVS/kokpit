@@ -287,3 +287,12 @@ test('uska traka i telefon: akcije u drugom redu', async ($, on) => {
     expect(await ui.find({ key: 'band-open' })).toBeDefined()
   }
 })
+
+test('traka bez podataka pokazuje jednu rečenicu umjesto crtica', async ($, on) => {
+  mock.clock(on)
+  mock.store(on)
+  const BAND = { component: 'AbovePrompt' as const, props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 60, scroll: { offset: 0, bodyRows: 3 }, view: {} } }
+  const ui = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...BAND })
+  expect(await ui.find({ type: 'Text', text: /nakon prve poruke/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^—$/ })).toBeUndefined()
+})
