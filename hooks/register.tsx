@@ -409,27 +409,62 @@ const seedResumed = async ($: EngineInterface, id: string) => {
   }
 }
 
+// Upute za /compact: ne prepričavaju razgovor (to radi /compact), nego kažu šta je prioritet,
+// šta se zadržava doslovno i šta se smije izostaviti. Redovi ostaju redovi.
+const COMPACT_SYSTEM = [
+  'Sastavljaš upute za naredbu /compact u Claude Code razgovoru. /compact sam piše sažetak; tvoje upute mu kažu šta je prioritet, da se rad nastavi bez gubitka preciznosti.',
+  'Jezik: bosanski, ijekavica, kratko i konkretno. Bez uvoda, bez navodnika, bez riječi /compact, bez markdown naslova.',
+  'Preporučeni oblik (prilagodi razgovoru; dijelove bez sadržaja izostavi, a dodaj vlastite kad nešto važno ne staje u njih, npr. korisnikove preferencije, dogovoreni način rada ili rizike):',
+  'Prvi red: jedna rečenica, sažetak za nastavak rada na <tema>.',
+  'Zadrži doslovno:',
+  '- konkretne vrijednosti koje se ne smiju izmijeniti: putanje, imena hostova, portovi, verzije, nazivi varijabli i postavki, komande, ID-evi',
+  'Odluke: kratko, šta je odlučeno i zašto',
+  'Otvoreno, ovim redom:',
+  '1. najvažniji naredni korak',
+  'Može se izostaviti: riješeni koraci, potvrde i dugački ispisi koji više ne trebaju.',
+  'Zadnji red uvijek: Pored navedenog, zadrži sve drugo što procijeniš važnim za nastavak.',
+  'Sam procijeni šta je važno; oblik je pomoć, ne pravilo. Ne prepričavaj urađeno osim kad treba za nastavak. Ne izmišljaj: što nije poznato, ne navodi.',
+  'Ulaz ima i signale iz sesije: izvorni cilj, izmijenjene fajlove, zadnje komande, greške alata i stanje gita. Koristi ih kao putokaz: izmijenjeni fajlovi i necommitovane izmjene obično spadaju u „Zadrži doslovno“, neriješena greška u „Otvoreno“, a izvorni cilj ostaje ako još nije ispunjen. Ono što je ispravljeno ili napušteno ne navodi kao otvoreno.',
+].join('\n')
+
 const smartCompact = async ($: EngineInterface) => {
   const cm = await chosen($, 'compact')
   $.ui.toast(`Model ${cm.model} (${cm.effort}) priprema upute za sažimanje…`, { timeoutMs: 15000 })
-  const prompts = (await $.session.messages())
-    .filter(m => m.role === 'user' && m.text.trim())
-    .slice(-8)
-    .map(m => `- ${m.text.replace(/\s+/g, ' ').slice(0, 800)}`)
-    .join('\n')
+  const msgs = (await $.session.messages())
+  const users = msgs.filter(m => m.role === 'user' && m.text.trim())
+  const goal = users.slice(0, 2).map(m => `- ${m.text.trim().slice(0, 800)}`).join('\n')
+  const talk = msgs
+    .filter(m => m.text.trim())
+    .slice(-16)
+    .map(m => `${m.role === 'user' ? 'Korisnik' : 'Claude'}: ${m.text.trim().slice(0, 1500)}`)
+    .join('\n\n')
+  const calls = msgs.flatMap(m => m.toolUses ?? [])
+  const edited = [...new Set(calls.filter(c => /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(c.tool)).map(c => String(c.input.file_path ?? c.input.notebook_path ?? '')).filter(Boolean))].slice(-20)
+  const commands = calls.filter(c => c.tool === 'Bash').slice(-10).map(c => `- ${String(c.input.command ?? '').replace(/\s+/g, ' ').slice(0, 160)}${c.isError ? '  (greška)' : ''}`)
+  const errors = calls.filter(c => c.isError).slice(-5).map(c => `- ${c.tool}: ${(c.text ?? '').replace(/\s+/g, ' ').slice(0, 200)}`)
+  const git = await $.process
+    .run(['/bin/sh', '-c', 'git rev-parse --abbrev-ref HEAD 2>/dev/null && git status --short 2>/dev/null | head -30'], { timeoutMs: 5000 })
+    .then(r => r.stdout.trim())
+    .catch(() => '')
   const files = [...(await read($, repeats))].slice(-15).map(r => `- ${r.path}`).join('\n')
+  const signals = [
+    goal && `Izvorni cilj (prve poruke korisnika):\n${goal}`,
+    edited.length > 0 && `Izmijenjeni fajlovi:\n${edited.map(f => `- ${f}`).join('\n')}`,
+    commands.length > 0 && `Zadnje komande:\n${commands.join('\n')}`,
+    errors.length > 0 && `Zadnje greške alata (možda već riješene):\n${errors.join('\n')}`,
+    git && `Git (grana, pa necommitovane izmjene):\n${git}`,
+    files && `Fajlovi čitani u sesiji:\n${files}`,
+  ]
+    .filter(Boolean)
+    .join('\n\n')
   let keep = ''
-  if (prompts) {
-    const r = await $.model.complete({
-      model: cm.model,
-      effort: cm.effort,
-      maxTokens: 8000,
-      system: 'Sastavljaš upute za sažimanje Claude Code razgovora. Odgovor je jedna linija na bosanskom, ijekavica, bez uvoda i navodnika: nabrajanje, odvojeno tačka-zarezom, onoga što sažetak mora zadržati: trenutni zadatak, donesene odluke, otvorena pitanja i ključne fajlove s putanjama.',
-      prompt: `Zadnje poruke korisnika:\n${prompts}\n\nFajlovi korišteni u sesiji:\n${files || '- nema'}`,
-    }).catch(() => null)
-    if (r?.isAnswered) keep = r.text.replace(/\s+/g, ' ').trim()
+  if (talk) {
+    const r = await $.model
+      .complete({ model: cm.model, effort: cm.effort, maxTokens: 8000, system: COMPACT_SYSTEM, prompt: `Zadnji dio razgovora:\n\n${talk}${signals ? `\n\n${signals}` : ''}` })
+      .catch(() => null)
+    if (r?.isAnswered) keep = r.text.replace(/^\s*\/compact\s*/i, '').replace(/\n{3,}/g, '\n\n').trim()
   }
-  await $.prompt.fill({ text: `/compact Zadržati: ${keep}` })
+  await $.prompt.fill({ text: keep ? `/compact ${keep}` : '/compact Zadrži doslovno: ' })
   $.ui.toast(keep ? 'Upute za sažimanje su upisane u polje za unos. Provjeriti pa pritisnuti Enter.' : 'Model nije dostupan. Upisati šta sažetak mora zadržati pa pritisnuti Enter.', { timeoutMs: 6000 })
 }
 

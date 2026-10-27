@@ -187,17 +187,25 @@ test('drugo otvaranje istog artefakta ide u preglednik', async ($, on) => {
 test('pametno sažimanje koristi model iz postavki i ne siječe upute', { options: { sazimanjeModel: 'opus', sazimanjeNapor: 'medium' } }, async ($, on) => {
   mock.clock(on)
   mock.store(on)
-  const long = Array.from({ length: 60 }, (_, i) => `stavka ${i}`).join('; ')
+  const long = ['Sažetak za nastavak rada na Kokpitu.', 'Zadrži doslovno:', ...Array.from({ length: 40 }, (_, i) => `- stavka ${i}`)].join('\n')
   const asked: { model: string; effort?: string; maxTokens?: number }[] = []
   let filled = ''
-  on('session.messages', () => ({ value: [{ role: 'user', text: 'Radimo na Kokpitu' }] }) as never)
-  on('model.complete', (_$, e) => (asked.push({ model: e.model, effort: e.effort, maxTokens: e.maxTokens }), { value: { isAnswered: true, text: long, usage: { input_tokens: 1, output_tokens: 1 } } }) as never)
+  let sent = ''
+  on('session.messages', () => ({ value: [{ role: 'user', text: 'Radimo na Kokpitu', toolUses: [] }, { role: 'assistant', text: 'Mijenjam fajl', toolUses: [{ id: '1', tool: 'Edit', input: { file_path: '/p/a.ts' } }, { id: '2', tool: 'Bash', input: { command: 'npm test' }, isError: true, text: 'FAIL a.test.ts' }] }] }) as never)
+  on('process.run', () => ({ value: { exitCode: 0, stdout: 'main\n M a.ts', stderr: '' } }))
+  on('model.complete', (_$, e) => ((sent = e.prompt), asked.push({ model: e.model, effort: e.effort, maxTokens: e.maxTokens }), { value: { isAnswered: true, text: long, usage: { input_tokens: 1, output_tokens: 1 } } }) as never)
   on('ui.toast', () => ({ value: undefined }))
   on('prompt.fill', (_$, e) => ((filled = (e as { text: string }).text), { isFilled: true }) as never)
   const desk = await $.ui.mount({ plugin: 'kokpit', surface: 'desktop', ...PANE })
   await desk.press({ key: 'act-compact-upute' })
   expect(asked[0]).toEqual({ model: 'opus', effort: 'medium', maxTokens: 8000 })
-  expect(filled).toBe(`/compact Zadržati: ${long}`)
+  expect(filled).toBe(`/compact ${long}`)
+  expect(filled.split('\n').length).toBe(42)
+  expect(sent).toContain('Izvorni cilj')
+  expect(sent).toContain('- /p/a.ts')
+  expect(sent).toContain('npm test  (greška)')
+  expect(sent).toContain('FAIL a.test.ts')
+  expect(sent).toContain('M a.ts')
 })
 
 test('kartica Postavke mijenja model za Smart compact', async ($, on) => {
