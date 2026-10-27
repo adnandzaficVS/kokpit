@@ -1,0 +1,20 @@
+{
+  "name": "kokpit",
+  "version": "0.1.0",
+  "description": "Kokpit za Claude Code: stanje konteksta, trošak, limiti plana, akcije i analiza sesije.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "pragAlata": {
+      "type": "number",
+      "description": "Prag u tokenima iznad kojeg rezultat jednog alata izaziva upozorenje",
+      "default": 8000,
+      "title": "Prag upozorenja (tokeni)"
+    },
+    "ai": {
+      "type": "boolean",
+      "description": "Da li /analiza zove Haiku za sažetak i preporuke",
+      "default": true,
+      "title": "AI sažetak u /analiza"
+    }
+  }
+}
